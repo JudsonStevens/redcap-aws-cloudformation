@@ -125,6 +125,102 @@ Login with:
 - **Username:** `redcap_admin`
 - **Password:** Your database master password (change immediately after first login)
 
+## DNS Configuration
+
+### Option 1: Use Route53 for DNS Management (Recommended)
+
+If you want Terraform to automatically manage your DNS records, configure these variables:
+
+```hcl
+# Enable Route53 and ACM
+use_route53      = true
+use_acm          = true
+
+# Your existing Route53 hosted zone
+hosted_zone_id   = "Z1234567890ABC"  # Found in Route53 console
+hosted_zone_name = "example.com"     # Your domain (e.g., mycompany.org)
+
+# Subdomain for REDCap
+domain_name      = "redcap"          # Creates redcap.example.com
+```
+
+**How it works:**
+1. Terraform creates an ACM certificate for `redcap.example.com`
+2. ACM automatically validates the certificate using DNS validation
+3. Terraform creates Route53 A and AAAA records pointing to the ALB
+4. ALB uses the ACM certificate for HTTPS termination
+
+**Prerequisites:**
+- You must already have a Route53 hosted zone for your domain
+- The hosted zone must be active and receiving queries
+- You need the hosted zone ID (found in Route53 console)
+
+### Option 2: Manual DNS Configuration
+
+If you prefer to manage DNS manually or use a different DNS provider:
+
+```hcl
+# Disable automatic DNS management
+use_route53 = false
+use_acm     = false
+
+# You'll get the ALB DNS name to configure manually
+alb_endpoint_name = "my-redcap-alb"
+```
+
+**Manual steps required:**
+1. After deployment, get the ALB DNS name:
+   ```bash
+   terraform output alb_dns_name
+   # Example output: my-redcap-alb-1234567890.us-east-1.elb.amazonaws.com
+   ```
+
+2. Create DNS records in your DNS provider:
+   ```
+   Type: CNAME
+   Name: redcap.yourcompany.com
+   Value: my-redcap-alb-1234567890.us-east-1.elb.amazonaws.com
+   TTL: 300
+   ```
+
+3. Configure SSL certificate:
+   - Option A: Upload certificate to ACM and update ALB listener
+   - Option B: Use ALB's default certificate (not recommended for production)
+   - Option C: Terminate SSL at application level
+
+### Option 3: Using Existing ACM Certificate
+
+If you already have an ACM certificate:
+
+```hcl
+use_route53 = true   # Still use Route53 for DNS records
+use_acm     = false  # Don't create new certificate
+
+# In the compute module, you would need to modify the configuration
+# to reference your existing certificate ARN
+```
+
+**Note:** This requires modifying the `modules/compute/main.tf` to accept an existing certificate ARN.
+
+### Finding Your Route53 Hosted Zone ID
+
+1. Go to AWS Console → Route53 → Hosted zones
+2. Click on your domain name
+3. Copy the "Hosted zone ID" (starts with Z)
+
+Example:
+```
+Domain: mycompany.org
+Hosted Zone ID: Z2ABC123DEF456GH
+```
+
+Your configuration would be:
+```hcl
+hosted_zone_id   = "Z2ABC123DEF456GH"
+hosted_zone_name = "mycompany.org"
+domain_name      = "redcap"  # Creates redcap.mycompany.org
+```
+
 ## Configuration Options
 
 ### Environment Variables
@@ -238,6 +334,262 @@ Apply with `terraform apply`.
 1. Modify Terraform configuration
 2. Run `terraform plan` to review changes
 3. Run `terraform apply` to implement
+
+## REDCap Code Customization and Updates
+
+### Making Changes to REDCap Code
+
+There are several approaches to customize REDCap code depending on your needs:
+
+#### Option 1: File-Level Customizations (Simple)
+
+For small changes like configuration files or custom hooks:
+
+1. **Access running instance:**
+   ```bash
+   # Find instance ID
+   aws ec2 describe-instances --filters "Name=tag:Name,Values=*redcap*" --query 'Reservations[].Instances[].InstanceId'
+   
+   # Connect via Session Manager
+   aws ssm start-session --target i-1234567890abcdef0
+   ```
+
+2. **Make changes directly:**
+   ```bash
+   sudo su -
+   cd /var/www/html
+   # Make your changes
+   nano redcap/hooks/redcap_connect.php
+   
+   # Restart services
+   systemctl restart nginx php-fpm
+   ```
+
+3. **Persist changes across scaling events:**
+   Create a custom configuration in the user data script or use S3 to store custom files.
+
+#### Option 2: Custom AMI Approach (Recommended for Major Changes)
+
+For significant customizations that need to persist across Auto Scaling events:
+
+1. **Create a custom AMI:**
+   ```bash
+   # Deploy base infrastructure first
+   terraform apply
+   
+   # Connect to instance and make all your customizations
+   aws ssm start-session --target i-1234567890abcdef0
+   
+   # Make your changes, test thoroughly
+   # ...
+   
+   # Create AMI from customized instance
+   aws ec2 create-image \
+     --instance-id i-1234567890abcdef0 \
+     --name "redcap-custom-$(date +%Y%m%d)" \
+     --description "REDCap with custom configurations"
+   ```
+
+2. **Update Launch Template to use custom AMI:**
+   
+   Modify `modules/compute/main.tf`:
+   ```hcl
+   # Replace the data source for AMI
+   data "aws_ami" "custom_redcap" {
+     most_recent = true
+     owners      = ["self"]  # Your account
+     
+     filter {
+       name   = "name"
+       values = ["redcap-custom-*"]
+     }
+   }
+   
+   # Update launch template
+   resource "aws_launch_template" "main" {
+     # ... other configuration ...
+     image_id = data.aws_ami.custom_redcap.id
+     # ... rest of configuration ...
+   }
+   ```
+
+3. **Deploy updated infrastructure:**
+   ```bash
+   terraform apply
+   ```
+
+#### Option 3: S3-Based Configuration Management
+
+For configuration files and small customizations:
+
+1. **Create S3 bucket for customizations:**
+   ```bash
+   aws s3 mb s3://your-redcap-customizations
+   ```
+
+2. **Upload custom files:**
+   ```bash
+   # Upload custom configuration files
+   aws s3 cp custom_config.php s3://your-redcap-customizations/config/
+   aws s3 cp custom_hooks.php s3://your-redcap-customizations/hooks/
+   ```
+
+3. **Modify user data script to download customizations:**
+   
+   Update `modules/compute/userdata.sh`:
+   ```bash
+   # Add after REDCap installation
+   echo "Downloading custom configurations..."
+   aws s3 sync s3://your-redcap-customizations/config/ /var/www/html/redcap/
+   aws s3 sync s3://your-redcap-customizations/hooks/ /var/www/html/redcap/hooks/
+   
+   # Set proper permissions
+   chown -R nginx:nginx /var/www/html
+   ```
+
+#### Option 4: Git-Based Deployment
+
+For version-controlled customizations:
+
+1. **Create Git repository for your REDCap customizations:**
+   ```bash
+   # Structure your repo like:
+   redcap-customizations/
+   ├── config/
+   │   └── custom_settings.php
+   ├── hooks/
+   │   └── redcap_connect.php
+   ├── modules/
+   │   └── custom_module/
+   └── plugins/
+       └── custom_plugin/
+   ```
+
+2. **Modify user data to clone and apply customizations:**
+   ```bash
+   # Add to userdata.sh after REDCap installation
+   cd /tmp
+   git clone https://github.com/yourorg/redcap-customizations.git
+   
+   # Copy customizations
+   cp -r redcap-customizations/config/* /var/www/html/redcap/
+   cp -r redcap-customizations/hooks/* /var/www/html/redcap/hooks/
+   cp -r redcap-customizations/modules/* /var/www/html/redcap/modules/
+   
+   # Set permissions
+   chown -R nginx:nginx /var/www/html
+   ```
+
+### Deploying REDCap Updates
+
+#### Updating REDCap Version
+
+1. **Update version in terraform.tfvars:**
+   ```hcl
+   redcap_version = "14.0.5"  # or "latest"
+   ```
+
+2. **Apply changes:**
+   ```bash
+   terraform apply
+   ```
+
+3. **Auto Scaling Group handles rolling update:**
+   - Creates new instances with updated REDCap version
+   - Waits for health checks to pass
+   - Terminates old instances
+   - Zero-downtime deployment
+
+#### Testing Updates
+
+**Blue-Green Deployment Approach:**
+
+1. **Create a staging environment:**
+   ```bash
+   # Copy production tfvars
+   cp terraform.tfvars terraform-staging.tfvars
+   
+   # Modify for staging
+   sed -i 's/environment = "prod"/environment = "staging"/' terraform-staging.tfvars
+   sed -i 's/domain_name = "redcap"/domain_name = "redcap-staging"/' terraform-staging.tfvars
+   
+   # Deploy staging
+   terraform apply -var-file="terraform-staging.tfvars"
+   ```
+
+2. **Test thoroughly in staging**
+
+3. **Promote to production:**
+   ```bash
+   terraform apply -var-file="terraform.tfvars"
+   ```
+
+#### Database Schema Updates
+
+For REDCap versions that require database changes:
+
+1. **Backup database before update:**
+   ```bash
+   # Create RDS snapshot
+   aws rds create-db-cluster-snapshot \
+     --db-cluster-identifier redcap-prod-aurora-cluster \
+     --db-cluster-snapshot-identifier redcap-backup-$(date +%Y%m%d)
+   ```
+
+2. **Apply infrastructure update**
+
+3. **Monitor for database migration completion:**
+   - Check CloudWatch logs
+   - Verify REDCap admin interface
+   - Test key functionality
+
+#### Rollback Strategy
+
+If an update fails:
+
+1. **Immediate rollback:**
+   ```bash
+   # Revert to previous version
+   git checkout HEAD~1 terraform.tfvars
+   terraform apply
+   ```
+
+2. **Database rollback (if needed):**
+   ```bash
+   # Restore from snapshot
+   aws rds restore-db-cluster-from-snapshot \
+     --db-cluster-identifier redcap-prod-aurora-cluster-restored \
+     --snapshot-identifier redcap-backup-20241201
+   ```
+
+### Best Practices for REDCap Customizations
+
+1. **Version Control:** Always version control your customizations
+2. **Testing:** Test all changes in staging environment first
+3. **Documentation:** Document all customizations and their purposes
+4. **Backup:** Backup database before major updates
+5. **Monitoring:** Monitor application logs during and after updates
+6. **Gradual Rollout:** Use Auto Scaling to gradually replace instances
+
+### Custom Module Development
+
+For developing REDCap External Modules:
+
+1. **Development workflow:**
+   ```bash
+   # Clone your module repo to local development
+   git clone https://github.com/yourorg/redcap-custom-module.git
+   
+   # Make changes locally
+   # Test in staging environment
+   
+   # Deploy to production via S3 or Git integration
+   ```
+
+2. **Production deployment:**
+   - Upload modules to S3 and download via user data
+   - Include in custom AMI
+   - Use REDCap's module repository system
 
 ## Security Considerations
 
